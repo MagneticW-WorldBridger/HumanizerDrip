@@ -1,16 +1,13 @@
-// worker.ts — duende que procesa los contactos UNO POR UNO 🧑‍🔧
-
-// 1️⃣ Traemos BullMQ y la conexión a Redis
 import { Worker } from 'bullmq';
+import IORedis from 'ioredis';
 import dotenv from 'dotenv';
 dotenv.config();
 
-// 2️⃣ Configuramos la conexión a Upstash Redis
-const connection = {
-  host: process.env.UPSTASH_REDIS_REST_URL!,
+// 2️⃣ Creamos conexión REST a Upstash Redis
+const redis = new IORedis(process.env.UPSTASH_REDIS_REST_URL!, {
   password: process.env.UPSTASH_REDIS_REST_TOKEN!,
-  tls: {}            // cifrado
-};
+  tls: {}  // cifrado
+});
 
 // 3️⃣ Función que hará el update en GHL
 async function updateContact({ contactId, locationId, customFieldId }: any) {
@@ -41,17 +38,16 @@ async function updateContact({ contactId, locationId, customFieldId }: any) {
   console.log(`✅ Contacto ${contactId} actualizado`);
 }
 
-// 4️⃣ Creamos el Worker de BullMQ
+// 4️⃣ Worker escuchando la cola
 new Worker(
-  'contactos',                // nombre de la cola
+  'contactos',
   async (job) => {
-    await updateContact(job.data);   // procesa el trabajo
+    await updateContact(job.data);
   },
   {
-    connection,
-    concurrency: 1            // SIEMPRE secuencial
+    connection: redis,
+    concurrency: 1
   }
 );
 
-// 5️⃣ Mensaje para saber que arrancó
 console.log('👂 Worker escuchando la cola "contactos"...');
