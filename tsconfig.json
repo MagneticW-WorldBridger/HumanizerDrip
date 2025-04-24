@@ -9,5 +9,5 @@
       "strict": false,
       "outDir": "build"
     },
-    "include": ["api/**/*.ts"]
+    "include": ["api/**/*.ts", "worker.ts"]
   }
