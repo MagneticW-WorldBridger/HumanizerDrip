@@ -1,14 +1,18 @@
 import { Queue } from 'bullmq';
+import IORedis from 'ioredis';
 import dotenv from 'dotenv';
-
-// 2️⃣ Cargamos las llaves secretas del archivo .env
 dotenv.config();
 
-// 3️⃣ Creamos la cola “contactos” y le decimos dónde vive Redis (Upstash)
+// Nos conectamos al Redis de Upstash vía TLS (rediss://...)
+const redis = new IORedis(process.env.REDIS_URL!, {
+  maxRetriesPerRequest: null
+});
+
 export const contactQueue = new Queue('contactos', {
-  connection: {
-    host: process.env.UPSTASH_REDIS_REST_URL!,   // URL que te dio Upstash
-    password: process.env.UPSTASH_REDIS_REST_TOKEN!, // Token de Upstash
-    tls: {}                                      // Conexión cifrada
+  connection: redis,
+  // opcional: attempts y backoff
+  defaultJobOptions: {
+    attempts: 3,
+    backoff: { type: 'exponential', delay: 60000 }
   }
 });
