@@ -3,18 +3,14 @@ import IORedis from 'ioredis';
 import dotenv from 'dotenv';
 dotenv.config();
 
-// 2️⃣ Creamos conexión REST a Upstash Redis
-const redis = new IORedis(process.env.UPSTASH_REDIS_REST_URL!, {
-  password: process.env.UPSTASH_REDIS_REST_TOKEN!,
-  tls: {},
-  maxRetriesPerRequest: null // 💥 ESTA ES LA CLAVE
-
+// 2️⃣ Conexión a Redis con TLS (la rediss://… que pusiste en .env)
+const redis = new IORedis(process.env.REDIS_URL!, {
+  maxRetriesPerRequest: null
 });
 
-// 3️⃣ Función que hará el update en GHL
+// 3️⃣ Función para llamar a GHL
 async function updateContact({ contactId, locationId, customFieldId }: any) {
   console.log(`🔔 Actualizando contacto ${contactId}`);
-
   const res = await fetch(
     `https://gh-connector.vercel.app/proxy/contacts/${contactId}`,
     {
@@ -31,19 +27,17 @@ async function updateContact({ contactId, locationId, customFieldId }: any) {
       })
     }
   );
-
   if (!res.ok) {
     const body = await res.text();
     throw new Error(`❌ Falló GHL (${res.status}): ${body}`);
   }
-
   console.log(`✅ Contacto ${contactId} actualizado`);
 }
 
-// 4️⃣ Worker escuchando la cola
+// 4️⃣ Creamos el Worker que escucha la cola “contactos”
 new Worker(
   'contactos',
-  async (job) => {
+  async job => {
     await updateContact(job.data);
   },
   {
@@ -52,4 +46,5 @@ new Worker(
   }
 );
 
+// 5️⃣ Mensaje para saber que arrancó
 console.log('👂 Worker escuchando la cola "contactos"...');
