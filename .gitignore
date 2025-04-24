@@ -1,2 +1,3 @@
 .vercel
-.env
+.envbuild/
+.DS_Store
