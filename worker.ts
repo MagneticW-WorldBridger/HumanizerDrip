@@ -6,7 +6,9 @@ dotenv.config();
 // 2️⃣ Creamos conexión REST a Upstash Redis
 const redis = new IORedis(process.env.UPSTASH_REDIS_REST_URL!, {
   password: process.env.UPSTASH_REDIS_REST_TOKEN!,
-  tls: {}  // cifrado
+  tls: {},
+  maxRetriesPerRequest: null // 💥 ESTA ES LA CLAVE
+
 });
 
 // 3️⃣ Función que hará el update en GHL
