@@ -1,5 +1,5 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { contactQueue } from './queue';          // ← viene de tu paso 3.2
+import { contactQueue } from './queue.js';          // ← viene de tu paso 3.2
 import dotenv from 'dotenv';
 dotenv.config();
 
