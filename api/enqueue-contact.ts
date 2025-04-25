@@ -55,7 +55,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const client2 = await pool.connect();
     try {
       await client2.query(
-        'INSERT INTO sequential_queue (location_id, run_at) VALUES ($1, $2)',
+        'INSERT INTO sequential_queue (contact_id,location_id, run_at) VALUES ($1, $2)',
         [locationId, newRunAt]
       );
     } finally {
