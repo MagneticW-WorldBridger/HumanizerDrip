@@ -4,6 +4,7 @@ import dotenv from 'dotenv';
 import { Pool } from 'pg';
 dotenv.config();
 
+// Conexión a PostgreSQL usando DATABASE_URL en .env
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
@@ -17,14 +18,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
     console.log('🧠 Webhook recibido:\n', JSON.stringify(req.body, null, 2));
 
-    const contactId = req.body.contact_id;
-    const locationId = req.body?.location?.id;
-    const timeframe = req.body?.customData?.TimeFrame;
+    const contactId = req.body.contact_id as string;
+    const locationId = req.body?.location?.id as string;
+    const timeframe = req.body?.customData?.TimeFrame as string;
 
     if (!contactId || !locationId || !timeframe) {
       return res.status(400).json({ error: 'Faltan datos (contactId, locationId o TimeFrame)' });
     }
 
+    // Parsear "min to max"
     const match = timeframe.match(/(\d+(?:\.\d+)?)\s*to\s*(\d+(?:\.\d+)?)/i);
     if (!match) {
       return res.status(400).json({ error: 'TimeFrame mal formado, usa "60 to 300"' });
@@ -32,24 +34,32 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const min = parseFloat(match[1]);
     const max = parseFloat(match[2]);
 
-    // Buscar el custom field "timerdone" en GHL
-    const fieldRes = await fetch(`https://gh-connector.vercel.app/proxy/locations/${locationId}/customFields`, {
-      headers: {
-        Authorization: process.env.GHL_API_KEY || '',
-        LocationId: locationId,
-      },
-    });
-    const fieldsArr = await fieldRes.json();
-    const allFields = Array.isArray(fieldsArr) ? fieldsArr : fieldsArr.customFields;
-    const timerField = allFields.find((f: any) => f.name?.toLowerCase() === 'timerdone');
-
+    // 1) Obtener el custom field "timerdone"
+    const fieldRes = await fetch(
+      `https://gh-connector.vercel.app/proxy/locations/${locationId}/customFields`,
+      {
+        headers: {
+          Authorization: process.env.GHL_API_KEY || '',
+          LocationId: locationId,
+        },
+      }
+    );
+    const fieldsPayload = await fieldRes.json();
+    const allFields = Array.isArray(fieldsPayload)
+      ? fieldsPayload
+      : fieldsPayload.customFields;
+    const timerField = allFields.find(
+      (f: any) => f.name?.toLowerCase() === 'timerdone'
+    );
     if (!timerField) {
-      return res.status(500).json({ error: 'Custom field "timerdone" no encontrado en GHL' });
+      return res
+        .status(500)
+        .json({ error: 'Custom field "timerdone" no encontrado en GHL' });
     }
 
-    // Consultar el último run_at para este locationId
+    // 2) Leer el último run_at para este locationId
     const client = await pool.connect();
-    let lastRunAt: Date = new Date();
+    let lastRunAt = new Date(); // si la tabla está vacía, arranca desde ahora
     try {
       const result = await client.query(
         'SELECT run_at FROM sequential_queue WHERE location_id = $1 ORDER BY run_at DESC LIMIT 1',
@@ -62,15 +72,23 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       client.release();
     }
 
-    // Calcular el nuevo run_at
-    const delaySeconds = Math.floor(Math.random() * (max - min + 1)) + min;
+    // 3) Asegurarnos de no programar en el pasado
+    const now = new Date();
+    if (lastRunAt < now) {
+      lastRunAt = now;
+    }
+
+    // 4) Elegir un delay aleatorio dentro del timeframe
+    const delaySeconds =
+      Math.floor(Math.random() * (max - min + 1)) + Math.floor(min);
     const newRunAt = new Date(lastRunAt.getTime() + delaySeconds * 1000);
 
-    // Insertar el nuevo run_at en la tabla con todos los campos obligatorios
+    // 5) Insertar en la tabla todos los campos obligatorios
     const client2 = await pool.connect();
     try {
       await client2.query(
-        `INSERT INTO sequential_queue (contact_id, location_id, delay_seconds, custom_field_id, run_at)
+        `INSERT INTO sequential_queue
+          (contact_id, location_id, delay_seconds, custom_field_id, run_at)
          VALUES ($1, $2, $3, $4, $5)`,
         [contactId, locationId, delaySeconds, timerField.id, newRunAt]
       );
@@ -78,11 +96,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       client2.release();
     }
 
-    // Calcular el delay en milisegundos desde ahora
-    const delayMs = newRunAt.getTime() - Date.now();
+    // 6) Calcular el delay real desde ahora
+    const delayMs = newRunAt.getTime() - now.getTime();
     console.log(`⏱️ Delay calculado: ${delayMs / 1000}s`);
 
-    // Encolar el trabajo con el delay calculado
+    // 7) Encolar en BullMQ con ese delay
     await contactQueue.add(
       'ghl-contact',
       {
