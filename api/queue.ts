@@ -3,16 +3,19 @@ import IORedis from 'ioredis';
 import dotenv from 'dotenv';
 dotenv.config();
 
-// Nos conectamos al Redis de Upstash vía TLS (rediss://...)
+// Creamos conexión con Redis usando URL de Upstash
 const redis = new IORedis(process.env.REDIS_URL!, {
-  maxRetriesPerRequest: null
+  maxRetriesPerRequest: null,
+  tls: {}, // Muy importante para conexiones "rediss://"
 });
 
 export const contactQueue = new Queue('contactos', {
   connection: redis,
-  // opcional: attempts y backoff
   defaultJobOptions: {
     attempts: 3,
-    backoff: { type: 'exponential', delay: 60000 }
+    backoff: {
+      type: 'exponential',
+      delay: 60000 // 1 minuto entre reintentos si falla
+    }
   }
 });
