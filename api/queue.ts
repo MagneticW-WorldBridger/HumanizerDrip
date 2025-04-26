@@ -15,7 +15,9 @@ export const contactQueue = new Queue('contactos', {
     attempts: 3,
     backoff: {
       type: 'exponential',
-      delay: 60000 // 1 minuto entre reintentos si falla
-    }
+      delay: 60000, // 1 minuto entre reintentos si falla
+    },
+    removeOnComplete: true, // 🔥 BORRA AUTOMÁTICAMENTE DE REDIS DESPUÉS DE TERMINAR
+    removeOnFail: true      // 🔥 TAMBIÉN SI FALLA, LO LIMPIA
   }
 });
