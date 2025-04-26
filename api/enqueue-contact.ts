@@ -10,6 +10,15 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
+// Función para convertir locationId a BigInt
+function locationIdToBigInt(locationId: string): bigint {
+  let hash = 0n;
+  for (let i = 0; i < locationId.length; i++) {
+    hash = (hash * 31n + BigInt(locationId.charCodeAt(i))) & 0x7fffffffffffffffn;
+  }
+  return hash;
+}
+
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Sólo POST, chavo.' });
@@ -34,90 +43,113 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const min = parseFloat(match[1]);
     const max = parseFloat(match[2]);
 
-    // 1) Obtener el custom field "timerdone"
-    const fieldRes = await fetch(
-      `https://gh-connector.vercel.app/proxy/locations/${locationId}/customFields`,
-      {
-        headers: {
-          Authorization: process.env.GHL_API_KEY || '',
-          LocationId: locationId,
-        },
-      }
-    );
-    const fieldsPayload = await fieldRes.json();
-    const allFields = Array.isArray(fieldsPayload)
-      ? fieldsPayload
-      : fieldsPayload.customFields;
-    const timerField = allFields.find(
-      (f: any) => f.name?.toLowerCase() === 'timerdone'
-    );
-    if (!timerField) {
-      return res
-        .status(500)
-        .json({ error: 'Custom field "timerdone" no encontrado en GHL' });
-    }
-
-    // 2) Leer el último run_at para este locationId
     const client = await pool.connect();
-    let lastRunAt = new Date(); // si la tabla está vacía, arranca desde ahora
     try {
-      const result = await client.query(
+      await client.query('BEGIN');
+
+      // 🔥 Lock para este locationId
+      const lockId = locationIdToBigInt(locationId);
+      await client.query('SELECT pg_advisory_xact_lock($1)', [lockId]);
+
+      // 🔥 Buscar si ya tenemos el custom field id en la tabla
+      let customFieldId: string | null = null;
+      const fieldRes = await client.query(
+        'SELECT timerdone_custom_field_id FROM location_custom_fields WHERE location_id = $1 LIMIT 1',
+        [locationId]
+      );
+
+      if (fieldRes.rows.length > 0) {
+        customFieldId = fieldRes.rows[0].timerdone_custom_field_id;
+      }
+
+      if (!customFieldId) {
+        // Buscar en GHL
+        const ghRes = await fetch(
+          `https://gh-connector.vercel.app/proxy/locations/${locationId}/customFields`,
+          {
+            headers: {
+              Authorization: process.env.GHL_API_KEY || '',
+              LocationId: locationId,
+            },
+          }
+        );
+        const fieldsPayload = await ghRes.json();
+        const allFields = Array.isArray(fieldsPayload)
+          ? fieldsPayload
+          : fieldsPayload.customFields;
+        const timerField = allFields.find((f: any) => f.name?.toLowerCase() === 'timerdone');
+        if (!timerField) {
+          await client.query('ROLLBACK');
+          return res.status(500).json({ error: 'Custom field "timerdone" no encontrado en GHL' });
+        }
+
+        customFieldId = timerField.id;
+
+        await client.query(
+          `INSERT INTO location_custom_fields (location_id, timerdone_custom_field_id, created_at)
+           VALUES ($1, $2, NOW())
+           ON CONFLICT (location_id) DO NOTHING`,
+          [locationId, customFieldId]
+        );
+      }
+
+      // 🔥 Leer el último run_at para este locationId
+      let lastRunAt = new Date();
+      const lastResult = await client.query(
         'SELECT run_at FROM sequential_queue WHERE location_id = $1 ORDER BY run_at DESC LIMIT 1',
         [locationId]
       );
-      if (result.rows.length > 0) {
-        lastRunAt = new Date(result.rows[0].run_at);
+      if (lastResult.rows.length > 0) {
+        lastRunAt = new Date(lastResult.rows[0].run_at);
       }
-    } finally {
-      client.release();
-    }
 
-    // 3) Asegurarnos de no programar en el pasado
-    const now = new Date();
-    if (lastRunAt < now) {
-      lastRunAt = now;
-    }
+      const now = new Date();
+      if (lastRunAt < now) {
+        lastRunAt = now;
+      }
 
-    // 4) Elegir un delay aleatorio dentro del timeframe
-    const delaySeconds =
-      Math.floor(Math.random() * (max - min + 1)) + Math.floor(min);
-    const newRunAt = new Date(lastRunAt.getTime() + delaySeconds * 1000);
+      // 🔥 Elegir un delay aleatorio
+      const delaySeconds = Math.floor(Math.random() * (max - min + 1)) + Math.floor(min);
+      const newRunAt = new Date(lastRunAt.getTime() + delaySeconds * 1000);
 
-    // 5) Insertar en la tabla todos los campos obligatorios
-    const client2 = await pool.connect();
-    try {
-      await client2.query(
+      // 🔥 Insertar en sequential_queue
+      await client.query(
         `INSERT INTO sequential_queue
           (contact_id, location_id, delay_seconds, custom_field_id, run_at)
          VALUES ($1, $2, $3, $4, $5)`,
-        [contactId, locationId, delaySeconds, timerField.id, newRunAt]
+        [contactId, locationId, delaySeconds, customFieldId, newRunAt]
       );
+
+      await client.query('COMMIT');
+
+      // 🔥 Encolar en BullMQ
+      const delayMs = newRunAt.getTime() - now.getTime();
+      console.log(`⏱️ Delay calculado: ${delayMs / 1000}s`);
+
+      await contactQueue.add(
+        'ghl-contact',
+        {
+          contactId,
+          locationId,
+          customFieldId,
+        },
+        {
+          delay: delayMs,
+          jobId: `${contactId}-${Date.now()}`,
+        }
+      );
+
+      console.log(`✅ Contacto ${contactId} encolado con ${delayMs / 1000}s`);
+      return res.status(200).json({ success: true });
+    } catch (error) {
+      await client.query('ROLLBACK');
+      console.error('🔥 ERROR ENCOLANDO:', error.stack || error.message || error);
+      return res.status(500).json({ error: 'Error interno del servidor' });
     } finally {
-      client2.release();
+      client.release();
     }
-
-    // 6) Calcular el delay real desde ahora
-    const delayMs = newRunAt.getTime() - now.getTime();
-    console.log(`⏱️ Delay calculado: ${delayMs / 1000}s`);
-
-    // 7) Encolar en BullMQ con ese delay
-    await contactQueue.add(
-      'ghl-contact',
-      {
-        contactId,
-        locationId,
-        customFieldId: timerField.id,
-      },
-      {
-        delay: delayMs,
-        jobId: `${contactId}-${Date.now()}`,
-      }
-    );
-
-    console.log(`✅ Contacto ${contactId} encolado con ${delayMs / 1000}s`);
-    return res.status(200).json({ success: true });
   } catch (err: any) {
-    console.error('🔥 ERROR ENCOLANDO:', err.stack || err.message || err);
+    console.error('🔥 ERROR GENERAL:', err.stack || err.message || err);
     return res.status(500).json({ error: 'Error interno del servidor' });
   }
 }
