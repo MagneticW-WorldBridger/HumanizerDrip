@@ -62,62 +62,23 @@ async function processReadyContacts() {
   }
 }
 
-/**
- * Procesa mensajes que fueron programados para ser publicados después
- * Busca claves con el patrón 'delayed:*' y, si ya pasó su tiempo de procesamiento,
- * los publica en su respectivo stream y elimina la clave de Redis
- */
-async function processDelayedMessages() {
-  console.log('⏱️ Iniciando procesador de mensajes retrasados...');
-  
+// Main scheduler loop: process ready contacts from Postgres based on run_at
+async function runSchedulerLoop() {
+  console.log('⏱️ Scheduler loop started...');
   while (true) {
     try {
-      // 1. Primero procesamos contactos listos en PostgreSQL
       await processReadyContacts();
-      
-      // 2. Luego procesamos mensajes delayed en Redis
-      const now = Date.now();
-      const keys = await redisClient.keys('delayed:*');
-      
-      if (keys.length > 0) {
-        console.log(`🔍 Encontrados ${keys.length} mensajes retrasados`);
-      }
-      
-      for (const key of keys) {
-        // Formato de la clave: delayed:TIMESTAMP:streamName:contactId
-        const parts = key.split(':');
-        const timestamp = parseInt(parts[1]);
-        
-        // Si ya pasó el tiempo programado
-        if (timestamp <= now) {
-          // Obtener los datos del mensaje
-          const dataString = await redisClient.get(key);
-          if (dataString) {
-            const { streamName, data } = JSON.parse(dataString);
-            
-            // Publicar en el stream correspondiente
-            const messageId = await publishToStream(streamName, data);
-            console.log(`🚀 Mensaje retrasado publicado en stream ${streamName} con ID ${messageId}`);
-            
-            // Eliminar la clave de Redis
-            await redisClient.del(key);
-          }
-        }
-      }
-      
-      // Esperar 1 segundo antes de la siguiente verificación
-      await new Promise(resolve => setTimeout(resolve, 1000));
     } catch (error) {
-      console.error('❌ Error procesando mensajes retrasados:', error);
-      // Esperar 5 segundos antes de reintentar en caso de error
-      await new Promise(resolve => setTimeout(resolve, 5000));
+      console.error('❌ Error in scheduler loop:', error);
     }
+    // Wait 1 second before next iteration
+    await new Promise(resolve => setTimeout(resolve, 1000));
   }
 }
 
-// Iniciar el procesador
-processDelayedMessages().catch(error => {
-  console.error('❌ Error fatal en scheduler:', error);
+// Start the scheduler loop
+runSchedulerLoop().catch(error => {
+  console.error('❌ Fatal error in scheduler:', error);
   process.exit(1);
 });
 

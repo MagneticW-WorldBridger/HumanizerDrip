@@ -51,7 +51,7 @@ async function removeFromQueue(contactId: string, locationId: string, workflowId
   const client = await pool.connect();
   try {
     await client.query(
-      `DELETE FROM sequential_queue 
+      `DELETE FROM sequential_queue
        WHERE contact_id = $1 AND location_id = $2 AND workflow_id = $3`,
       [contactId, locationId, workflowId || 'noworkflow']
     );

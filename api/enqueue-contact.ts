@@ -1,5 +1,4 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { getStreamName, publishToStream, scheduleDelayedMessage } from './queue.js';
 import dotenv from 'dotenv';
 import { Pool } from 'pg';
 dotenv.config();
@@ -123,38 +122,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
       await client.query('COMMIT');
 
-      // 🔥 Obtener nombre del stream basado en locationId y workflowId
-      const streamName = getStreamName(locationId, workflowId);
-      
-      // 🔥 Calcular delay
-      const delayMs = Math.max(0, newRunAt.getTime() - now.getTime());
-      console.log(`⏱️ Delay calculado: ${delayMs / 1000}s para ${streamName}`);
-
-      // Datos a publicar en el stream
-      const messageData = {
-        contactId,
-        locationId,
-        workflowId,
-        customFieldId,
-        runAt: newRunAt.toISOString(),
-        enqueuedAt: now.toISOString()
-      };
-
-      // Si hay delay, programar para más tarde
-      if (delayMs > 0) {
-        await scheduleDelayedMessage(streamName, messageData, delayMs);
-        console.log(`📅 Contacto ${contactId} programado para ${newRunAt.toISOString()}`);
-      } else {
-        // Publicar inmediatamente en el stream
-        const messageId = await publishToStream(streamName, messageData);
-        console.log(`✅ Contacto ${contactId} publicado en stream ${streamName} con ID ${messageId}`);
-      }
-
-      return res.status(200).json({ 
+      // defer publishing to the scheduler; handler only writes to Postgres
+      return res.status(200).json({
         success: true,
-        streamName,
         runAt: newRunAt.toISOString(),
-        delayed: delayMs > 0
       });
     } catch (error) {
       await client.query('ROLLBACK');
