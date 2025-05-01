@@ -4,7 +4,7 @@ import dotenv from 'dotenv';
 import { Pool } from 'pg';
 dotenv.config();
 
-// Conexión a PostgreSQL usando DATABASE_URL en .env
+// Conexión a PostgreSQL usando DATABASE_URL en .env TEST(NOT TEST BUT JUST FORCING A GIT CHANGE SO I CAN PUSH
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
