@@ -47,13 +47,13 @@ async function updateContact(contactId: string, locationId: string, customFieldI
 }
 
 // Función para borrar el contacto de la tabla de PostgreSQL
-async function removeFromQueue(contactId: string, locationId: string, workflowId: string) {
+async function removeFromQueue(contactId: string, locationId: string, workflowId: string = 'noworkflow') {
   const client = await pool.connect();
   try {
     await client.query(
       `DELETE FROM sequential_queue 
        WHERE contact_id = $1 AND location_id = $2 AND workflow_id = $3`,
-      [contactId, locationId, workflowId || 'default']
+      [contactId, locationId, workflowId || 'noworkflow']
     );
     console.log(`🗑️ Contacto ${contactId} borrado de sequential_queue`);
   } finally {
@@ -73,7 +73,7 @@ async function processStreamMessage(
     // Extraer datos del mensaje
     const contactId = messageData.contactId;
     const locationId = messageData.locationId;
-    const workflowId = messageData.workflowId || 'default';
+    const workflowId = messageData.workflowId || 'noworkflow';
     const customFieldId = messageData.customFieldId;
     
     // Actualizar contacto en GHL

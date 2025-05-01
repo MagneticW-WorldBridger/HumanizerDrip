@@ -29,7 +29,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     const contactId = req.body.contact_id as string;
     const locationId = req.body?.location?.id as string;
-    const workflowId = req.body?.workflow?.id as string || 'default';
+    const workflowId = req.body?.workflow?.id as string || 'noworkflow';
     const timeframe = req.body?.customData?.TimeFrame as string;
 
     if (!contactId || !locationId || !timeframe) {

@@ -36,7 +36,7 @@ async function processReadyContacts() {
           const messageData = {
             contactId: row.contact_id,
             locationId: row.location_id,
-            workflowId: row.workflow_id || 'default',
+            workflowId: row.workflow_id || 'noworkflow',
             customFieldId: row.custom_field_id,
             runAt: row.run_at.toISOString(),
             enqueuedAt: new Date().toISOString()

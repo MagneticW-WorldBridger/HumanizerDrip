@@ -1,3 +1,4 @@
 .vercel
 .envbuild/
 .DS_Store
+node_modules/

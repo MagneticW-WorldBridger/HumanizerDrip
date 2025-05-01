@@ -17,7 +17,7 @@ export const redisClient = redis;
  * @param workflowId ID del workflow (opcional)
  * @returns Nombre del stream
  */
-export function getStreamName(locationId: string, workflowId: string = 'default'): string {
+export function getStreamName(locationId: string, workflowId: string = 'noworkflow'): string {
   return `stream:location:${locationId}:workflow:${workflowId}`;
 }
 
