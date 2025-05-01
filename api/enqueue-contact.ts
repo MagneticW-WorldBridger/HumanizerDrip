@@ -1,5 +1,5 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { contactQueue } from './queue.js';
+import { getStreamName, publishToStream, scheduleDelayedMessage } from './queue.js';
 import dotenv from 'dotenv';
 import { Pool } from 'pg';
 dotenv.config();
@@ -29,6 +29,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     const contactId = req.body.contact_id as string;
     const locationId = req.body?.location?.id as string;
+    const workflowId = req.body?.workflow?.id as string || 'default';
     const timeframe = req.body?.customData?.TimeFrame as string;
 
     if (!contactId || !locationId || !timeframe) {
@@ -93,11 +94,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         );
       }
 
-      // 🔥 Leer el último run_at para este locationId
+      // 🔥 Leer el último run_at para este locationId Y workflowId
       let lastRunAt = new Date();
       const lastResult = await client.query(
-        'SELECT run_at FROM sequential_queue WHERE location_id = $1 ORDER BY run_at DESC LIMIT 1',
-        [locationId]
+        'SELECT run_at FROM sequential_queue WHERE location_id = $1 AND workflow_id = $2 ORDER BY run_at DESC LIMIT 1',
+        [locationId, workflowId]
       );
       if (lastResult.rows.length > 0) {
         lastRunAt = new Date(lastResult.rows[0].run_at);
@@ -112,35 +113,49 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const delaySeconds = Math.floor(Math.random() * (max - min + 1)) + Math.floor(min);
       const newRunAt = new Date(lastRunAt.getTime() + delaySeconds * 1000);
 
-      // 🔥 Insertar en sequential_queue
+      // 🔥 Insertar en sequential_queue con workflowId
       await client.query(
         `INSERT INTO sequential_queue
-          (contact_id, location_id, delay_seconds, custom_field_id, run_at)
-         VALUES ($1, $2, $3, $4, $5)`,
-        [contactId, locationId, delaySeconds, customFieldId, newRunAt]
+          (contact_id, location_id, workflow_id, delay_seconds, custom_field_id, run_at)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [contactId, locationId, workflowId, delaySeconds, customFieldId, newRunAt]
       );
 
       await client.query('COMMIT');
 
-      // 🔥 Encolar en BullMQ
-      const delayMs = newRunAt.getTime() - now.getTime();
-      console.log(`⏱️ Delay calculado: ${delayMs / 1000}s`);
+      // 🔥 Obtener nombre del stream basado en locationId y workflowId
+      const streamName = getStreamName(locationId, workflowId);
+      
+      // 🔥 Calcular delay
+      const delayMs = Math.max(0, newRunAt.getTime() - now.getTime());
+      console.log(`⏱️ Delay calculado: ${delayMs / 1000}s para ${streamName}`);
 
-      await contactQueue.add(
-        'ghl-contact',
-        {
-          contactId,
-          locationId,
-          customFieldId,
-        },
-        {
-          delay: delayMs,
-          jobId: `${contactId}-${Date.now()}`,
-        }
-      );
+      // Datos a publicar en el stream
+      const messageData = {
+        contactId,
+        locationId,
+        workflowId,
+        customFieldId,
+        runAt: newRunAt.toISOString(),
+        enqueuedAt: now.toISOString()
+      };
 
-      console.log(`✅ Contacto ${contactId} encolado con ${delayMs / 1000}s`);
-      return res.status(200).json({ success: true });
+      // Si hay delay, programar para más tarde
+      if (delayMs > 0) {
+        await scheduleDelayedMessage(streamName, messageData, delayMs);
+        console.log(`📅 Contacto ${contactId} programado para ${newRunAt.toISOString()}`);
+      } else {
+        // Publicar inmediatamente en el stream
+        const messageId = await publishToStream(streamName, messageData);
+        console.log(`✅ Contacto ${contactId} publicado en stream ${streamName} con ID ${messageId}`);
+      }
+
+      return res.status(200).json({ 
+        success: true,
+        streamName,
+        runAt: newRunAt.toISOString(),
+        delayed: delayMs > 0
+      });
     } catch (error) {
       await client.query('ROLLBACK');
       console.error('🔥 ERROR ENCOLANDO:', error.stack || error.message || error);

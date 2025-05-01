@@ -4,17 +4,22 @@
     "type": "module",
     "scripts": {
         "build": "tsc",
-        "vercel-build": "tsc"
+        "vercel-build": "tsc",
+        "worker": "node worker.js",
+        "scheduler": "node scheduler.js",
+        "flush-redis": "node flush-redis.js",
+        "start": "concurrently \"npm run worker\" \"npm run scheduler\""
     },
     "dependencies": {
         "bullmq": "^5.49.2",
-        "dotenv": "^16.3.1",
+        "dotenv": "^16.5.0",
         "ioredis": "^5.6.1",
         "pg": "^8.11.3"
     },
     "devDependencies": {
         "@types/node": "^22.14.1",
         "@vercel/node": "^5.1.14",
+        "concurrently": "^8.2.2",
         "typescript": "^5.4.3"
     }
 }

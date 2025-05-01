@@ -9,5 +9,5 @@
       "strict": false,
       "outDir": "build"
     },
-    "include": ["api/**/*.ts", "worker.ts"]
+    "include": ["api/**/*.ts", "worker.ts", "scheduler.ts", "flush-redis.ts", "check-redis.ts", "check-postgres.ts"]
   }

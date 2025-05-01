@@ -511,3 +511,451 @@ WHERE run_at > NOW() + interval '1 day';
    - Ensure active queues are being processed
    - Log when jobs move from delayed to active
    - Track completion of jobs with a success counter 
+
+## Plan de Implementación de Colas Dinámicas
+
+Después de revisar el estado actual del código y comprobando que el sistema básico funciona correctamente, debemos implementar las siguientes mejoras para cumplir con los objetivos originales:
+
+### Objetivos Principales
+1. **Procesamiento Secuencial Por Ubicación y Workflow:**
+   - Cada combinación de ubicación+workflow debe tener su propia cola secuencial
+   - Las diferentes ubicaciones o diferentes workflows deben procesarse en paralelo
+
+2. **Reglas de Organización de Colas:**
+   - ✅ Misma ubicación + mismo workflow = UNA cola secuencial (para mantener el orden)
+   - ✅ Misma ubicación + diferentes workflows = colas PARALELAS
+   - ✅ Diferentes ubicaciones = colas PARALELAS
+
+### Implementación Paso a Paso
+
+#### 1. Modificar api/queue.ts para Soportar Colas Dinámicas
+```typescript
+// api/queue.ts - Actualizado para colas dinámicas
+import { Queue } from 'bullmq';
+import IORedis from 'ioredis';
+import dotenv from 'dotenv';
+dotenv.config();
+
+// 🚀 SINGLE Redis connection (re-used everywhere)
+export const redis = new IORedis(process.env.REDIS_URL!, {
+  maxRetriesPerRequest: null,
+  tls: {}, // required for Upstash "rediss://"
+});
+
+// 👉 Queue factory – call with any queue name you need
+export function makeQueue(name: string) {
+  return new Queue(name, {
+    connection: redis,
+    defaultJobOptions: {
+      attempts: 3,
+      backoff: { type: 'exponential', delay: 60_000 },
+      removeOnComplete: true,
+      removeOnFail: true,
+    },
+  });
+}
+```
+
+#### 2. Actualizar el Worker para Escuchar Todas las Colas
+```typescript
+// worker.ts - Actualizado para escuchar colas dinámicas
+import { Worker } from 'bullmq';
+import IORedis from 'ioredis';
+import { Pool } from 'pg';
+import dotenv from 'dotenv';
+dotenv.config();
+
+// 1️⃣ Conexión a Redis - DIRECTA, no importada
+const redis = new IORedis(process.env.REDIS_URL!, {
+  maxRetriesPerRequest: null,
+  tls: {}  // Important for Upstash "rediss://"
+});
+
+// 2️⃣ Conexión a PostgreSQL - DIRECTA
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
+
+// 3️⃣ Función para llamar a GHL
+async function updateContact({ contactId, locationId, customFieldId }: any) {
+  console.log(`🔔 Actualizando contacto ${contactId}`);
+  const res = await fetch(
+    `https://gh-connector.vercel.app/proxy/contacts/${contactId}`,
+    {
+      method: 'PUT',
+      headers: {
+        'Authorization': process.env.GHL_API_KEY || '',
+        'LocationId': locationId,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        customFields: [{ id: customFieldId, field_value: 'YES' }]
+      })
+    }
+  );
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`❌ Falló GHL (${res.status}): ${body}`);
+  }
+  console.log(`✅ Contacto ${contactId} actualizado`);
+}
+
+// 4️⃣ Función para borrar el contacto de la tabla
+async function removeFromQueue(contactId: string, locationId: string, workflowId: string = 'noworkflow') {
+  const client = await pool.connect();
+  try {
+    await client.query(
+      `DELETE FROM sequential_queue WHERE contact_id = $1 AND location_id = $2 AND workflow_id = $3`,
+      [contactId, locationId, workflowId]
+    );
+    console.log(`🗑️  Contacto ${contactId} borrado de sequential_queue`);
+  } finally {
+    client.release();
+  }
+}
+
+// 5️⃣ Worker que escucha TODAS las colas - usando '*' 
+new Worker(
+  '*',
+  async (job) => {
+    const { contactId, locationId, customFieldId, workflowId = 'noworkflow' } = job.data;
+    await updateContact(job.data);
+    await removeFromQueue(contactId, locationId, workflowId);
+  },
+  { connection: redis, concurrency: 1 }
+);
+
+console.log('👂 Worker escuchando TODAS las colas...');
+```
+
+#### 3. Actualizar enqueue-contact.ts para Soportar Workflows y Colas Dinámicas
+```typescript
+// api/enqueue-contact.ts - Cambios principales
+// ...código existente...
+
+export default async function handler(req: VercelRequest, res: VercelResponse) {
+  // ...código existente...
+
+  try {
+    console.log('🧠 Webhook recibido:\n', JSON.stringify(req.body, null, 2));
+
+    const contactId = req.body.contact_id as string;
+    const locationId = req.body?.location?.id as string;
+    const workflowId = req.body?.workflow?.id as string ?? 'noworkflow';  // Extraer workflowId
+    const timeframe = req.body?.customData?.TimeFrame as string;
+
+    // ...más código existente...
+
+    // 🔥 Leer el último run_at para este locationId+workflowId combination
+    const baseKey = `${locationId}_${workflowId}`;  // Clave única para la cola
+    let lastRunAt = new Date(); 
+    const lastResult = await client.query(
+      'SELECT run_at FROM sequential_queue WHERE location_id = $1 AND workflow_id = $2 ORDER BY run_at DESC LIMIT 1',
+      [locationId, workflowId]  // Añadir workflowId a la consulta
+    );
+    
+    // ...más código existente...
+    
+    // 🔥 Insertar en sequential_queue con workflowId
+    await client.query(
+      `INSERT INTO sequential_queue
+          (contact_id, location_id, delay_seconds, custom_field_id, run_at, workflow_id)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+      [contactId, locationId, delaySeconds, customFieldId, newRunAt, workflowId]
+    );
+
+    await client.query('COMMIT');
+
+    // 🔥 Encolar en BullMQ usando una cola dinámica con locationId_workflowId
+    const queueKey = baseKey;  // Usar la combinación locationId_workflowId como nombre de cola
+    const delayMs = newRunAt.getTime() - now.getTime();
+    
+    await makeQueue(queueKey).add(
+      'ghl-contact',
+      {
+        contactId,
+        locationId,
+        customFieldId,
+        workflowId,  // Incluir el workflowId en los datos del trabajo
+      },
+      {
+        delay: delayMs,
+        jobId: `${contactId}-${Date.now()}`,
+      }
+    );
+
+    // ...resto del código...
+  }
+}
+```
+
+### Pruebas de Verificación
+Una vez implementados estos cambios, deberías probar:
+
+1. **Verificación Básica:**
+   - Enviar un contacto para una ubicación y workflow específico
+   - Verificar que se crea la cola con el nombre `{locationId}_{workflowId}`
+   - Confirmar que el worker procesa el trabajo
+
+2. **Verificación de Paralelismo:**
+   - Enviar contactos con la misma ubicación pero diferentes workflows
+   - Verificar que se crean colas separadas
+   - Confirmar que los trabajos se procesan en paralelo
+
+3. **Verificación de Secuencia:**
+   - Enviar múltiples contactos con la misma ubicación y workflow
+   - Verificar que se procesan en orden secuencial según sus run_at
+
+### Monitoreo
+- Usa los scripts check-redis.js y check-postgres.js para verificar el estado
+- Monitorea los logs del worker para confirmar el procesamiento correcto 
+
+# Plan de Implementación de Colas Dinámicas con BullMQ 5.49.2
+
+## Análisis del Soporte para Wildcards en BullMQ 5.49.2
+
+Después de una investigación exhaustiva, he determinado que **BullMQ no soporta oficialmente el uso de wildcards ("*") para que un worker escuche múltiples colas dinámicamente**. Esta es una limitación conocida en BullMQ, como se puede ver en varias issues de GitHub y foros de discusión.
+
+### Alternativas Verificadas:
+
+1. **Enfoque de Múltiples Workers**: Crear un worker por cada cola que necesitemos procesar.
+   ```typescript
+   // Ejemplo: worker-location-workflow.ts
+   const worker = new Worker(`location-${locationId}-workflow-${workflowId}`, processor, {
+     connection: redisConnection,
+     // otras opciones...
+   });
+   ```
+
+2. **Registrar Múltiples Colas en un Proceso**: Crear múltiples instancias de Worker dentro del mismo proceso Node.js.
+   ```typescript
+   // Ejemplo: dynamic-workers.ts
+   const createDynamicWorkers = (locationIds, workflowIds) => {
+     const workers = [];
+     for (const locationId of locationIds) {
+       for (const workflowId of workflowIds) {
+         workers.push(
+           new Worker(`location-${locationId}-workflow-${workflowId}`, processor, {
+             connection: redisConnection,
+             // otras opciones...
+           })
+         );
+       }
+     }
+     return workers;
+   };
+   ```
+
+3. **Enfoque de Factory**: Crear workers bajo demanda cuando se detectan nuevas colas.
+   ```typescript
+   // Ejemplo: worker-factory.ts
+   class WorkerFactory {
+     private workers = new Map();
+     
+     createWorker(locationId, workflowId) {
+       const queueName = `location-${locationId}-workflow-${workflowId}`;
+       
+       if (!this.workers.has(queueName)) {
+         const worker = new Worker(queueName, processor, {
+           connection: redisConnection,
+           // otras opciones...
+         });
+         
+         this.workers.set(queueName, worker);
+         return worker;
+       }
+       
+       return this.workers.get(queueName);
+     }
+   }
+   ```
+
+## Solución Recomendada: Matriz de Colas Dinámicas
+
+Basado en el análisis de riesgo y la compatibilidad con BullMQ 5.49.2, recomiendo el siguiente enfoque:
+
+1. **Crear una función de nombramiento de colas consistente**:
+   ```typescript
+   // cola-utils.ts
+   export const getQueueName = (locationId: string, workflowId: string) => {
+     return `location-${locationId}-workflow-${workflowId}`;
+   };
+   ```
+
+2. **Crear un sistema de gestión de workers**:
+   ```typescript
+   // worker-manager.ts
+   import { Worker, Queue } from 'bullmq';
+   import { getQueueName } from './cola-utils';
+   
+   export class WorkerManager {
+     private workers = new Map<string, Worker>();
+     private redisConnection;
+     
+     constructor(redisConnection) {
+       this.redisConnection = redisConnection;
+     }
+     
+     getOrCreateWorker(locationId: string, workflowId: string) {
+       const queueName = getQueueName(locationId, workflowId);
+       
+       if (!this.workers.has(queueName)) {
+         console.log(`Creating worker for queue: ${queueName}`);
+         const worker = new Worker(queueName, this.processJob.bind(this), {
+           connection: this.redisConnection,
+           // otras opciones...
+         });
+         
+         this.workers.set(queueName, worker);
+       }
+       
+       return this.workers.get(queueName);
+     }
+     
+     async processJob(job) {
+       // Lógica de procesamiento común para todos los jobs
+       console.log(`Processing job ${job.id} from queue ${job.queueName}`);
+       
+       // Implementar lógica específica según sea necesario
+       // Puedes extraer información del nombre de la cola si es necesario:
+       const queueParts = job.queueName.split('-');
+       const locationId = queueParts[1];
+       const workflowId = queueParts[3];
+       
+       // Procesar el job específicamente para esta location + workflow
+       return { success: true, locationId, workflowId };
+     }
+     
+     getActiveWorkers() {
+       return Array.from(this.workers.keys());
+     }
+   }
+   ```
+
+3. **Función de encolamiento que usa la misma convención de nombres**:
+   ```typescript
+   // enqueue-contact.ts - Modificación propuesta
+   import { Queue } from 'bullmq';
+   import { getQueueName } from './cola-utils';
+   
+   export default async function enqueueContact(req, res) {
+     const { locationId, workflowId, contact, runAt } = req.body;
+     
+     if (!locationId || !workflowId || !contact) {
+       return res.status(400).json({ error: 'Missing required parameters' });
+     }
+     
+     const queueName = getQueueName(locationId, workflowId);
+     const queue = new Queue(queueName, { connection: redisConnection });
+     
+     const now = new Date();
+     const newRunAt = new Date(runAt || now);
+     
+     // Calcular correctamente el delay
+     let delay = 0;
+     if (newRunAt > now) {
+       delay = newRunAt.getTime() - now.getTime();
+     }
+     
+     try {
+       const job = await queue.add(
+         'process-contact',
+         {
+           contact,
+           locationId,
+           workflowId,
+           runAt: newRunAt.toISOString(),
+         },
+         {
+           delay,
+           removeOnComplete: true,
+           removeOnFail: 10,
+         },
+       );
+       
+       return res.status(200).json({
+         jobId: job.id,
+         queueName,
+         runAt: newRunAt.toISOString(),
+       });
+     } catch (error) {
+       console.error('Failed to enqueue job:', error);
+       return res.status(500).json({ error: 'Failed to enqueue job' });
+     }
+   }
+   ```
+
+## Ventajas y Consideraciones de Este Enfoque
+
+### Ventajas:
+1. ✅ **Compatibilidad Garantizada**: Funciona con BullMQ 5.49.2 sin requerir características no soportadas
+2. ✅ **Aislamiento de Colas**: Cada combinación locationId + workflowId tiene su propia cola, garantizando orden FIFO donde se necesita
+3. ✅ **Procesamiento Paralelo**: Diferentes locationId + workflowId se procesan en paralelo
+4. ✅ **Escalabilidad**: Puedes ajustar la concurrency por worker independientemente
+5. ✅ **Dinamismo**: Los workers se crean bajo demanda cuando se necesitan
+
+### Consideraciones:
+1. ⚠️ **Gestión de Memoria**: Monitorear el número de workers creados para evitar exceso de uso de memoria
+2. ⚠️ **Registro Centralizado**: Implementar un sistema para registrar todas las colas activas
+3. ⚠️ **Limpieza de Workers**: Establecer un mecanismo para cerrar workers inactivos después de cierto tiempo
+
+## Implementación Paso a Paso
+
+1. **Crear los archivos de utilidad**:
+   - `cola-utils.ts` - Para la convención de nombres consistente
+   - `worker-manager.ts` - Para la gestión dinámica de workers
+
+2. **Modificar api/queue.ts** para soportar colas dinámicas:
+   ```typescript
+   // queue.ts
+   import { Queue, Worker } from 'bullmq';
+   import IORedis from 'ioredis';
+   import { WorkerManager } from './worker-manager';
+   
+   // Redis connection
+   const connection = new IORedis(process.env.REDIS_URL, {
+     maxRetriesPerRequest: null,
+     tls: {}, // Importante para conexiones "rediss://"
+   });
+   
+   // Exportar la conexión para reutilizarla
+   export const redisConnection = connection;
+   
+   // Crear y exportar el WorkerManager
+   export const workerManager = new WorkerManager(connection);
+   
+   // Helper para crear o obtener una cola específica
+   export function getQueue(locationId: string, workflowId: string) {
+     const queueName = getQueueName(locationId, workflowId);
+     return new Queue(queueName, { connection });
+   }
+   ```
+
+3. **Actualizar api/enqueue-contact.ts** según lo propuesto anteriormente
+
+4. **Crear un worker.ts actualizado**:
+   ```typescript
+   // worker.ts
+   import { workerManager } from './api/queue';
+   
+   // Esta función inicializa los workers para las combinaciones conocidas
+   // de locationId y workflowId al inicio (opcional)
+   async function initializeWorkers() {
+     // Puedes cargar los locationIds y workflowIds desde una base de datos
+     // o archivo de configuración
+     const knownLocationIds = ['location1', 'location2'];
+     const knownWorkflowIds = ['workflow1', 'workflow2'];
+     
+     for (const locationId of knownLocationIds) {
+       for (const workflowId of knownWorkflowIds) {
+         workerManager.getOrCreateWorker(locationId, workflowId);
+       }
+     }
+     
+     console.log('Workers initialized:', workerManager.getActiveWorkers());
+   }
+   
+   // Iniciar workers
+   initializeWorkers().catch(console.error);
+   ``` 
