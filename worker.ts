@@ -177,29 +177,13 @@ class StreamManager {
         `SELECT DISTINCT location_id, workflow_id 
          FROM sequential_queue 
          WHERE run_at <= NOW() + INTERVAL '1 minute'
-         LIMIT 100`  // Limitar para evitar sobrecarga
+         LIMIT 100`
       );
       
       // Activar streams para cada combinación
       for (const row of result.rows) {
         const streamName = getStreamName(row.location_id, row.workflow_id);
         this.activateStream(streamName);
-      }
-      
-      // Opcionalmente, buscar streams existentes en Redis
-      if (this.activeStreams.size === 0) {
-        try {
-          const streamKeys = await redisClient.keys('stream:location:*');
-          for (const streamKey of streamKeys) {
-            // Verificar que el stream tenga mensajes antes de activarlo
-            const len = await redisClient.xlen(streamKey);
-            if (len > 0) {
-              this.activateStream(streamKey);
-            }
-          }
-        } catch (redisError) {
-          console.error('Error buscando streams en Redis:', redisError);
-        }
       }
       
       // Log conservador (solo si hay streams activos)
@@ -289,11 +273,8 @@ async function processStreamMessage(
     // Confirmar que el mensaje ha sido procesado
     await redisClient.xack(streamName, CONSUMER_GROUP, messageId);
     
-    // Opcionalmente, eliminar el mensaje del stream
-    // Esto es útil para mantener el stream pequeño, pero pierdes el historial
-    if (process.env.DELETE_PROCESSED_MESSAGES === 'true') {
-      await redisClient.xdel(streamName, messageId);
-    }
+    // Borrar el mensaje procesado para evitar resurrección
+    await redisClient.xdel(streamName, messageId);
     
     console.log(`✅ Mensaje ${messageId} procesado correctamente`);
     return true;
