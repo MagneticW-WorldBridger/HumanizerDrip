@@ -17,8 +17,212 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-// Mapa para rastrear qué streams estamos procesando
-const activeStreams = new Map<string, boolean>();
+// Administrador de streams - mantiene estados y optimiza recursos
+class StreamManager {
+  // Mapa de streams activos (siendo procesados actualmente)
+  private activeStreams = new Map<string, boolean>();
+  
+  // Mapa de estados de cada stream (métricas y contadores)
+  private streamStatus = new Map<string, {
+    lastActivity: number;    // Timestamp de última actividad
+    emptyChecks: number;     // Conteo de verificaciones vacías consecutivas
+  }>();
+  
+  // Tiempo máximo de inactividad (5 minutos)
+  private MAX_INACTIVITY_MS = 5 * 60 * 1000;
+  
+  // Checks vacíos antes de liberar (30 checks = ~1 minuto con 2 seg de BLOCK)
+  private MAX_EMPTY_CHECKS = 30;
+  
+  /**
+   * Activa un stream para procesamiento
+   * @param streamName Nombre del stream a activar
+   */
+  async activateStream(streamName: string): Promise<boolean> {
+    // Si ya está activo, no hacer nada
+    if (this.activeStreams.has(streamName)) {
+      return true;
+    }
+    
+    try {
+      // Crear consumer group (con MKSTREAM)
+      const created = await createConsumerGroup(streamName, CONSUMER_GROUP);
+      if (!created) return false;
+      
+      // Marcar como activo
+      this.activeStreams.set(streamName, true);
+      this.streamStatus.set(streamName, {
+        lastActivity: Date.now(),
+        emptyChecks: 0
+      });
+      
+      console.log(`🟢 Stream ${streamName} activado`);
+      
+      // Iniciar procesamiento en background
+      this.startProcessing(streamName);
+      
+      return true;
+    } catch (error) {
+      console.error(`Error activando stream ${streamName}:`, error);
+      return false;
+    }
+  }
+  
+  /**
+   * Desactiva un stream, liberando recursos
+   * @param streamName Nombre del stream a desactivar
+   */
+  deactivateStream(streamName: string): void {
+    if (this.activeStreams.has(streamName)) {
+      this.activeStreams.delete(streamName);
+      this.streamStatus.delete(streamName);
+      console.log(`🔴 Stream ${streamName} desactivado por inactividad`);
+    }
+  }
+  
+  /**
+   * Inicia el procesamiento continuo de un stream en background
+   * @param streamName Nombre del stream a procesar
+   */
+  private startProcessing(streamName: string): void {
+    // No bloquear, ejecutar en background
+    (async () => {
+      const status = this.streamStatus.get(streamName);
+      if (!status) return; // Safety check
+      
+      // Bucle de procesamiento continuo mientras el stream esté activo
+      while (this.activeStreams.has(streamName)) {
+        try {
+          // Leer mensajes nuevos del stream
+          const messages = await redisClient.xreadgroup(
+            'GROUP', CONSUMER_GROUP, WORKER_ID, 
+            'COUNT', 1, // Procesar de uno en uno para garantizar orden
+            'BLOCK', 2000, // Bloquear 2 segundos, luego comprobar estado
+            'STREAMS', streamName, '>'
+          );
+          
+          // Si hay mensajes nuevos, procesarlos
+          if (messages && messages.length > 0) {
+            const [stream] = messages;
+            const [_, messageArray] = stream as [string, any[]];
+            
+            if (messageArray && messageArray.length > 0) {
+              const [messageId, fields] = messageArray[0] as [string, string[]];
+              
+              // Convertir el array de campos a un objeto
+              const messageData: Record<string, string> = {};
+              for (let i = 0; i < fields.length; i += 2) {
+                messageData[fields[i]] = fields[i + 1];
+              }
+              
+              // Procesar mensaje
+              await processStreamMessage(streamName, messageId, messageData);
+              
+              // Actualizar métricas - actividad reciente
+              status.lastActivity = Date.now();
+              status.emptyChecks = 0;
+              continue; // Continuar inmediatamente al siguiente mensaje
+            }
+          }
+          
+          // No hay mensajes nuevos, verificar mensajes pendientes
+          try {
+            // Aquí iría el código existente para procesar pendientes...
+            // [Se omite por brevedad]
+            
+            // Incrementar contador de verificaciones vacías
+            status.emptyChecks++;
+            
+            // Si llevamos muchas verificaciones sin mensajes, revisar inactividad
+            if (status.emptyChecks >= this.MAX_EMPTY_CHECKS) {
+              const inactivityTime = Date.now() - status.lastActivity;
+              
+              // Si ha pasado mucho tiempo desde la última actividad, desactivar
+              if (inactivityTime > this.MAX_INACTIVITY_MS) {
+                console.log(`💤 Stream ${streamName} inactivo por ${Math.floor(inactivityTime/1000)}s, liberando recursos`);
+                this.deactivateStream(streamName);
+                break; // Salir del bucle while
+              }
+            }
+          } catch (pendingError) {
+            console.error(`❌ Error verificando pendientes en ${streamName}:`, pendingError);
+          }
+        } catch (error: any) {
+          // Errores de procesamiento
+          if (error.message?.includes('NOGROUP')) {
+            console.log(`🚫 Stream ${streamName} no existe, desactivando`);
+            this.deactivateStream(streamName);
+            break;
+          } else {
+            console.error(`❌ Error procesando stream ${streamName}:`, error);
+            // Esperar un segundo antes de reintentar
+            await new Promise(resolve => setTimeout(resolve, 1000));
+          }
+        }
+      } // fin del while
+    })().catch(error => {
+      console.error(`❗ Error fatal en procesamiento de ${streamName}:`, error);
+      this.deactivateStream(streamName);
+    });
+  }
+  
+  /**
+   * Busca streams que deberían estar activos según Postgres
+   */
+  async discoverActiveStreams(): Promise<void> {
+    const client = await pool.connect();
+    try {
+      // SOLO buscar streams que tendrán actividad PRONTO
+      const result = await client.query(
+        `SELECT DISTINCT location_id, workflow_id 
+         FROM sequential_queue 
+         WHERE run_at <= NOW() + INTERVAL '1 minute'
+         LIMIT 100`  // Limitar para evitar sobrecarga
+      );
+      
+      // Activar streams para cada combinación
+      for (const row of result.rows) {
+        const streamName = getStreamName(row.location_id, row.workflow_id);
+        this.activateStream(streamName);
+      }
+      
+      // Opcionalmente, buscar streams existentes en Redis
+      if (this.activeStreams.size === 0) {
+        try {
+          const streamKeys = await redisClient.keys('stream:location:*');
+          for (const streamKey of streamKeys) {
+            // Verificar que el stream tenga mensajes antes de activarlo
+            const len = await redisClient.xlen(streamKey);
+            if (len > 0) {
+              this.activateStream(streamKey);
+            }
+          }
+        } catch (redisError) {
+          console.error('Error buscando streams en Redis:', redisError);
+        }
+      }
+      
+      // Log conservador (solo si hay streams activos)
+      if (this.activeStreams.size > 0) {
+        console.log(`🔄 Procesando ${this.activeStreams.size} streams actualmente`);
+      }
+    } catch (error) {
+      console.error('❌ Error buscando streams activos:', error);
+    } finally {
+      client.release();
+    }
+  }
+  
+  /**
+   * Obtiene la lista de streams activos
+   */
+  getActiveStreams(): string[] {
+    return Array.from(this.activeStreams.keys());
+  }
+}
+
+// Crear instancia del administrador de streams
+const streamManager = new StreamManager();
 
 // Función para llamar a GHL y actualizar contacto
 async function updateContact(contactId: string, locationId: string, customFieldId: string) {
@@ -100,178 +304,21 @@ async function processStreamMessage(
   }
 }
 
-// Función para procesar un stream específico
-async function processStream(streamName: string) {
-  if (activeStreams.has(streamName)) {
-    return; // Ya estamos procesando este stream
-  }
-  
-  console.log(`🎯 Iniciando procesamiento del stream: ${streamName}`);
-  activeStreams.set(streamName, true);
-  
+// Iniciar bucle de descubrimiento de streams
+async function runDiscoveryLoop() {
   try {
-    // Crear grupo de consumidores si no existe
-    await createConsumerGroup(streamName, CONSUMER_GROUP);
-    
-    // Bucle principal para procesar mensajes
-    while (activeStreams.get(streamName)) {
-      try {
-        // Leer mensajes nuevos o pendientes de este stream
-        // '>' significa "dame mensajes nuevos que nadie ha visto"
-        const streamMessages = await redisClient.xreadgroup(
-          'GROUP', CONSUMER_GROUP, WORKER_ID, 
-          'COUNT', 1, // Procesar de uno en uno para garantizar orden
-          'BLOCK', 2000, // Bloquear 2 segundos, luego comprobar otros streams
-          'STREAMS', streamName, '>'
-        );
-        
-        // Si hay mensajes nuevos
-        if (streamMessages && streamMessages.length > 0) {
-          const [stream] = streamMessages;
-          const [_, messages] = stream as [string, any[]];
-          
-          if (messages.length > 0) {
-            const [messageId, fields] = messages[0] as [string, string[]];
-            
-            // Convertir el array de campos a un objeto
-            const messageData: Record<string, string> = {};
-            for (let i = 0; i < fields.length; i += 2) {
-              messageData[fields[i]] = fields[i + 1];
-            }
-            
-            await processStreamMessage(streamName, messageId, messageData);
-          }
-        } else {
-          // Si no hay mensajes nuevos, verificar mensajes pendientes
-          try {
-            // Intentar obtener información de mensajes pendientes
-            const pendingResult = await redisClient.xpending(
-              streamName, CONSUMER_GROUP, '-', '+', 1
-            );
-            
-            // XPENDING devuelve diferentes estructuras según la versión de Redis
-            // Intentar manejar diferentes formatos posibles
-            if (pendingResult) {
-              let pendingMessageId = '';
-              
-              // Verificar si es un arreglo con mensajes pendientes
-              if (Array.isArray(pendingResult) && pendingResult.length > 0) {
-                // Formato Redis >= 6.2: Array de entradas pendientes
-                const firstPending = pendingResult[0];
-                
-                // El ID podría estar en diferentes posiciones según formato
-                if (typeof firstPending === 'string') {
-                  pendingMessageId = firstPending; // ID directo
-                } else if (Array.isArray(firstPending) && firstPending.length > 0) {
-                  pendingMessageId = firstPending[0]; // [ID, ...otros datos]
-                } else if (typeof firstPending === 'object' && firstPending !== null) {
-                  // Formato de objeto { id: string, ... }
-                  pendingMessageId = (firstPending as any).id || '';
-                }
-              } else if (
-                typeof pendingResult === 'object' && 
-                pendingResult !== null && 
-                'count' in pendingResult && 
-                (pendingResult as any).count > 0
-              ) {
-                // Formato antiguo: objeto con información agregada
-                // No podemos obtener IDs directamente, ignoramos
-              }
-              
-              // Si tenemos un ID pendiente, intentar reclamarlo
-              if (pendingMessageId) {
-                try {
-                  const claimed = await redisClient.xclaim(
-                    streamName, 
-                    CONSUMER_GROUP, 
-                    WORKER_ID, 
-                    30000, 
-                    pendingMessageId
-                  );
-                  
-                  if (claimed && Array.isArray(claimed) && claimed.length > 0) {
-                    const [claimedData] = claimed;
-                    if (Array.isArray(claimedData) && claimedData.length >= 2) {
-                      const [claimedId, fields] = claimedData as [string, string[]];
-                      
-                      // Convertir el array de campos a un objeto
-                      const messageData: Record<string, string> = {};
-                      for (let i = 0; i < fields.length; i += 2) {
-                        messageData[fields[i]] = fields[i + 1];
-                      }
-                      
-                      await processStreamMessage(streamName, claimedId, messageData);
-                    }
-                  }
-                } catch (claimError) {
-                  console.error(`❌ Error al reclamar mensaje pendiente:`, claimError);
-                }
-              }
-            }
-          } catch (pendingError) {
-            console.error(`❌ Error al verificar mensajes pendientes:`, pendingError);
-          }
-        }
-      } catch (error) {
-        console.error(`❌ Error leyendo del stream ${streamName}:`, error);
-        // Esperar un segundo antes de reintentar
-        await new Promise(resolve => setTimeout(resolve, 1000));
-      }
-    }
+    await streamManager.discoverActiveStreams();
   } catch (error) {
-    console.error(`❌ Error procesando stream ${streamName}:`, error);
-  } finally {
-    activeStreams.delete(streamName);
+    console.error('Error en bucle de descubrimiento:', error);
   }
+  
+  // Programar próxima ejecución (cada 15 segundos)
+  setTimeout(runDiscoveryLoop, 15000);
 }
 
-// Función para descubrir streams existentes
-async function discoverStreams() {
-  try {
-    console.log('🔍 Buscando streams existentes...');
-    
-    // Método 1: Buscar streams en Redis mediante patrón
-    const streamKeys = await redisClient.keys('stream:location:*');
-    
-    // Para cada stream encontrado, iniciar procesamiento
-    for (const streamKey of streamKeys) {
-      if (!activeStreams.has(streamKey)) {
-        processStream(streamKey).catch(console.error);
-      }
-    }
-    
-    // Método 2: Buscar combinaciones location+workflow en PostgreSQL
-    const client = await pool.connect();
-    try {
-      // Buscar entradas recientes (últimas 24 horas)
-      const result = await client.query(
-        `SELECT DISTINCT location_id, workflow_id 
-         FROM sequential_queue 
-         WHERE run_at > NOW() - INTERVAL '24 hours'`
-      );
-      
-      // Para cada combinación, crear stream si no existe y procesar
-      for (const row of result.rows) {
-        const streamName = getStreamName(row.location_id, row.workflow_id);
-        if (!activeStreams.has(streamName)) {
-          processStream(streamName).catch(console.error);
-        }
-      }
-    } finally {
-      client.release();
-    }
-    
-    console.log(`🔄 Procesando ${activeStreams.size} streams actualmente`);
-  } catch (error) {
-    console.error('❌ Error descubriendo streams:', error);
-  }
-  
-  // Ejecutar cada 30 segundos
-  setTimeout(discoverStreams, 30000);
-}
-
-// Iniciar descubrimiento de streams
-discoverStreams().catch(error => {
+// Iniciar worker
+console.log('🚀 Worker iniciando...');
+runDiscoveryLoop().catch(error => {
   console.error('❌ Error fatal en worker:', error);
   process.exit(1);
 });

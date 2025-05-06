@@ -39,17 +39,21 @@ export async function publishToStream(streamName: string, data: Record<string, a
  * Crea un grupo de consumidores para un stream si no existe
  * @param streamName Nombre del stream
  * @param groupName Nombre del grupo
+ * @returns true si el grupo se creó correctamente o ya existía, false en caso de error
  */
-export async function createConsumerGroup(streamName: string, groupName: string): Promise<void> {
+export async function createConsumerGroup(streamName: string, groupName: string): Promise<boolean> {
   try {
-    // Crear grupo y stream si no existen
+    // Crear grupo y stream si no existen (MKSTREAM es crucial)
     await redis.xgroup('CREATE', streamName, groupName, '0', 'MKSTREAM');
     console.log(`Grupo ${groupName} creado para stream ${streamName}`);
+    return true; // Creado exitosamente
   } catch (error: any) {
     // Ignorar error si el grupo ya existe
-    if (!error.message.includes('BUSYGROUP')) {
-      throw error;
+    if (error.message.includes('BUSYGROUP')) {
+      return true; // Ya existía, todo bien
     }
+    console.error(`Error creando grupo para ${streamName}:`, error.message);
+    return false; // Error no esperado
   }
 }
 
