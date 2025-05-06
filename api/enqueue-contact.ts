@@ -18,6 +18,22 @@ function locationIdToBigInt(locationId: string): bigint {
   return hash;
 }
 
+function normalizePayload(body: any): any {
+  // Detectar si es el formato alternativo con 'extras'
+  if (body.extras && body.meta?.key === "humanizer_drip") {
+    // Mapeo 1:1 desde el schema nuevo al formato que espera la lógica actual
+    const { contactId, locationId, workflowId, TimeFrame } = body.extras;
+    return {
+      contact_id: contactId,
+      location: { id: locationId },
+      workflow: { id: workflowId },
+      customData: { TimeFrame }
+    };
+  }
+  // Si no es el formato alternativo, devolver el body sin cambios
+  return body;
+}
+
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Sólo POST, chavo.' });
